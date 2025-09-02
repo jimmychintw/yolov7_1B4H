@@ -297,8 +297,27 @@ def train(hyp, opt, device, tb_writer=None):
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
-    compute_loss_ota = ComputeLossOTA(model)  # init loss class
-    compute_loss = ComputeLoss(model)  # init loss class
+    
+    # ============== MultiHead Loss Selection (Added) ==============
+    # Automatically select appropriate loss function based on detection head type
+    from models.yolo import MultiHeadDetect
+    det = model.model[-1]  # get detection layer
+    is_multihead = isinstance(det, MultiHeadDetect)
+    
+    # Loss function selection
+    if is_multihead:
+        from utils.loss_multihead import ComputeLossMultiHead
+        compute_loss = ComputeLossMultiHead(model)  # init loss class
+        compute_loss_ota = ComputeLossOTA(model)  # keep OTA for compatibility
+        logger.info(f'Using MultiHead loss with {det.n_heads} heads (Strategy A)')
+        if hasattr(compute_loss, 'head_weights'):
+            logger.info(f'Head weights: {compute_loss.head_weights}')
+    else:
+        # Original loss selection logic
+        compute_loss_ota = ComputeLossOTA(model)  # init loss class
+        compute_loss = ComputeLoss(model)  # init loss class
+    # ============== End of MultiHead Addition ==============
+    
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'

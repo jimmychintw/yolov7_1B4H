@@ -1,4 +1,13 @@
 # Repo-specific GitIgnore ----------------------------------------------------------------------------------------------
+# Backup files
+*.backup*
+train.py.backup_step*
+models/*.backup_step*
+utils/*.backup_step*
+
+# Code review packages
+code_review_*/
+code_review.tar.gz
 *.jpg
 *.jpeg
 *.png

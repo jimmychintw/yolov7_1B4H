@@ -841,3 +841,159 @@ if __name__ == '__main__':
     # print("Run 'tensorboard --logdir=models/runs' to view tensorboard at http://localhost:6006/")
     # tb_writer.add_graph(model.model, img)  # add model to tensorboard
     # tb_writer.add_image('test', img[0], dataformats='CWH')  # add model to tensorboard
+
+
+# ============== MultiHead Detection Module (Added for MultiHead) ==============
+# This is a new class added for multi-head detection capability
+# It does not modify any existing code above
+
+class MultiHeadDetect(nn.Module):
+    """
+    Multi-Head Detection layer for YOLOv7 (Strategy A)
+    - Shared box/objectness regression  
+    - Separate classification heads
+    - Compatible with original Detect interface
+    """
+    stride = None  # strides computed during build
+    export = False  # export mode
+    
+    def __init__(self, nc=80, anchors=(), ch=(), n_heads=4, config_path='data/coco-multihead.yaml'):
+        """
+        Initialize MultiHeadDetect module
+        
+        Args:
+            nc: number of classes
+            anchors: anchor boxes
+            ch: input channels for each scale
+            n_heads: number of detection heads
+            config_path: path to multihead configuration
+        """
+        super(MultiHeadDetect, self).__init__()
+        
+        # Basic attributes (same as Detect)
+        self.nc = nc  # number of classes
+        self.no = nc + 5  # number of outputs per anchor
+        self.nl = len(anchors)  # number of detection layers
+        self.na = len(anchors[0]) // 2  # number of anchors
+        self.n_heads = n_heads
+        self.grid = [torch.zeros(1)] * self.nl  # init grid
+        
+        # Register anchors as buffers (same as Detect)
+        a = torch.tensor(anchors).float().view(self.nl, -1, 2)
+        self.register_buffer('anchors', a)  # shape(nl,na,2)
+        self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
+        
+        # Load multihead configuration
+        from utils.multihead_utils import MultiHeadConfig
+        self.config = MultiHeadConfig(config_path)
+        
+        # ============ Strategy A Implementation ============
+        # Shared regression/objectness branch (box + obj = 5 outputs)
+        self.reg_obj_convs = nn.ModuleList()
+        for x in ch:
+            # Conv2d: in_channels=x, out_channels=na*5, kernel=1x1
+            self.reg_obj_convs.append(nn.Conv2d(x, self.na * 5, 1))
+        
+        # Separate classification branches for each head
+        self.cls_convs = nn.ModuleList()
+        for head_id in range(n_heads):
+            head_cls = nn.ModuleList()
+            for x in ch:
+                # Conv2d: in_channels=x, out_channels=na*nc, kernel=1x1
+                head_cls.append(nn.Conv2d(x, self.na * self.nc, 1))
+            self.cls_convs.append(head_cls)
+        
+        # Compatibility: collect all convolutions in 'm' for bias initialization
+        self.m = nn.ModuleList()
+        
+        # Add reg_obj convolutions
+        for conv in self.reg_obj_convs:
+            self.m.append(conv)
+        
+        # Add all classification convolutions
+        for head_cls in self.cls_convs:
+            for conv in head_cls:
+                self.m.append(conv)
+    
+    def forward(self, x):
+        """
+        Forward pass implementation for Strategy A
+        
+        Training mode returns: (reg_obj_outputs, cls_outputs)
+        Inference mode returns: (predictions, x)
+        """
+        z = []  # inference output
+        self.training |= self.export
+        
+        # Process shared reg/obj branch
+        reg_obj_outputs = []
+        for i in range(self.nl):
+            # Apply reg_obj convolution
+            reg_obj = self.reg_obj_convs[i](x[i])  # (bs, na*5, ny, nx)
+            bs, _, ny, nx = reg_obj.shape
+            
+            # Reshape to (bs, na, ny, nx, 5)
+            reg_obj = reg_obj.view(bs, self.na, 5, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+            reg_obj_outputs.append(reg_obj)
+        
+        # Process classification heads
+        cls_outputs = []
+        for head_id in range(self.n_heads):
+            head_cls_output = []
+            for i in range(self.nl):
+                # Apply classification convolution for this head
+                cls = self.cls_convs[head_id][i](x[i])  # (bs, na*nc, ny, nx)
+                bs, _, ny, nx = cls.shape
+                
+                # Reshape to (bs, na, ny, nx, nc)
+                cls = cls.view(bs, self.na, self.nc, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+                head_cls_output.append(cls)
+            cls_outputs.append(head_cls_output)
+        
+        # Return based on mode
+        if self.training:
+            # Training mode: return raw outputs for loss computation
+            return (reg_obj_outputs, cls_outputs)
+        else:
+            # Inference mode: combine outputs and apply transformations
+            for i in range(self.nl):
+                reg_obj = reg_obj_outputs[i]
+                bs, na, ny, nx, _ = reg_obj.shape
+                
+                # Select best classification head for each class
+                # For now, use simple mask-based selection
+                best_cls = torch.zeros(bs, na, ny, nx, self.nc, device=reg_obj.device)
+                
+                for head_id in range(self.n_heads):
+                    # Get class mask for this head
+                    head_mask = self.config.get_head_mask(head_id, reg_obj.device)
+                    cls = cls_outputs[head_id][i]
+                    
+                    # Copy classifications for classes this head is responsible for
+                    best_cls[..., head_mask] = cls[..., head_mask]
+                
+                # Combine reg_obj and best_cls
+                combined = torch.cat([reg_obj, best_cls], -1)  # (bs, na, ny, nx, 85)
+                
+                # Grid generation
+                if self.grid[i].shape[2:4] != combined.shape[2:4]:
+                    self.grid[i] = self._make_grid(nx, ny).to(combined.device)
+                
+                # Apply sigmoid and transformations
+                y = combined.sigmoid()
+                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                
+                # Reshape and append
+                z.append(y.view(bs, -1, self.no))
+            
+            # Return predictions and original features
+            return (torch.cat(z, 1), x)
+    
+    @staticmethod
+    def _make_grid(nx=20, ny=20):
+        """Create mesh grid (same as Detect)"""
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+# ============== End of MultiHead Addition ==============
