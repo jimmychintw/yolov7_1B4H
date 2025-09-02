@@ -311,7 +311,13 @@ def train(hyp, opt, device, tb_writer=None):
         compute_loss_ota = ComputeLossOTA(model)  # keep OTA for compatibility
         logger.info(f'Using MultiHead loss with {det.n_heads} heads (Strategy A)')
         if hasattr(compute_loss, 'head_weights'):
-            logger.info(f'Head weights: {compute_loss.head_weights}')
+            logger.info(f'  Head weights (normalized): {[round(w, 4) for w in compute_loss.head_weights]}')
+        # Log detailed head configuration
+        if hasattr(det, 'config'):
+            for i in range(det.n_heads):
+                head_name = det.config.head_assignments[i].get('name', f'head_{i}')
+                num_classes = len(det.config.head_assignments[i]['classes'])
+                logger.info(f'  Head {i} ({head_name}): {num_classes} classes')
     else:
         # Original loss selection logic
         compute_loss_ota = ComputeLossOTA(model)  # init loss class

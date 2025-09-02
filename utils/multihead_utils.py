@@ -5,8 +5,11 @@ Maintains compatibility with original YOLOv7 structure
 
 import yaml
 import torch
-import numpy as np
+import logging
 from pathlib import Path
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 
 class MultiHeadConfig:
@@ -59,8 +62,10 @@ class MultiHeadConfig:
                 self.class_to_head[class_id] = head_id
         
         # Validate all classes are assigned
-        assert len(self.class_to_head) == self.nc, \
-            f"Not all classes assigned: {len(self.class_to_head)} != {self.nc}"
+        if len(self.class_to_head) != self.nc:
+            raise ValueError(
+                f"Not all classes assigned: {len(self.class_to_head)} != {self.nc}"
+            )
         
         # Head to classes mapping (for convenience)
         self.head_to_classes = {
@@ -158,18 +163,19 @@ def validate_config(config_path='data/coco-multihead.yaml'):
     """Validate MultiHead configuration file"""
     config = MultiHeadConfig(config_path)
     
-    print(f"Configuration loaded: {config}")
-    print(f"Head weights: {config.get_head_weights()}")
+    logger.info(f"Configuration loaded: {config}")
+    logger.info(f"Head weights: {config.get_head_weights()}")
     
     # Check class coverage
     all_classes = set()
     for head_id in range(config.n_heads):
         classes = set(config.get_classes_for_head(head_id))
         all_classes.update(classes)
-        print(f"Head {head_id} ({config.get_head_name(head_id)}): {len(classes)} classes")
+        logger.info(f"Head {head_id} ({config.get_head_name(head_id)}): {len(classes)} classes")
     
-    assert len(all_classes) == config.nc, "Not all classes covered!"
-    print(f"✓ All {config.nc} classes covered")
+    if len(all_classes) != config.nc:
+        raise ValueError("Not all classes covered!")
+    logger.info(f"✓ All {config.nc} classes covered")
     
     return True
 
